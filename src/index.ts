@@ -55,6 +55,13 @@ interface GenerateReportArgs {
   endDate?: string;
 }
 
+interface FindPayingClientLeadsArgs {
+  sourceAccounts: string[];
+  maxCommentsPerPost?: number;
+  maxPostsPerAccount?: number;
+  niche?: string;
+}
+
 // Utility function to validate post URL
 const isValidPostUrl = (url: string): boolean => {
   return /^https:\/\/(www\.)?instagram\.com\/p\/[A-Za-z0-9_-]+\/?/.test(url);
@@ -244,6 +251,33 @@ class InstagramEngagementServer {
             required: ['account'],
           },
         },
+        {
+          name: 'find_paying_client_leads',
+          description: 'Scan recent posts on one or more Instagram accounts and surface commenters who show high-intent buying signals for fitness/fat-loss coaching — questions about pricing, programs, how to sign up, transformation desire, or frustration with current results. Returns a ranked lead list with their username, signal score, matched phrases, and a suggested DM opener.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sourceAccounts: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Instagram account handles whose recent posts will be scanned (e.g. ["fat.loss.operator", "competitor_account"])',
+              },
+              maxCommentsPerPost: {
+                type: 'number',
+                description: 'Max comments to scan per post (default: 200)',
+              },
+              maxPostsPerAccount: {
+                type: 'number',
+                description: 'How many recent posts to scan per account (default: 10)',
+              },
+              niche: {
+                type: 'string',
+                description: 'Coaching niche to tune signal keywords (default: "fat loss coaching")',
+              },
+            },
+            required: ['sourceAccounts'],
+          },
+        },
       ],
     }));
 
@@ -273,6 +307,8 @@ class InstagramEngagementServer {
             return await this.handleIdentifyLeads(args as unknown as IdentifyLeadsArgs);
           case 'generate_engagement_report':
             return await this.handleGenerateReport(args as unknown as GenerateReportArgs);
+          case 'find_paying_client_leads':
+            return await this.handleFindPayingClientLeads(args as unknown as FindPayingClientLeadsArgs);
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Tool ${request.params.name} not found`);
         }
@@ -774,7 +810,251 @@ class InstagramEngagementServer {
     }
   }
   
-   private async getMediaIdFromUrl(url: string): Promise<string | null> {
+   private async handleFindPayingClientLeads(args: FindPayingClientLeadsArgs) {
+    console.error('[Tool] handleFindPayingClientLeads called with args:', args);
+    const {
+      sourceAccounts,
+      maxCommentsPerPost = 200,
+      maxPostsPerAccount = 10,
+      niche = 'fat loss coaching',
+    } = args;
+
+    if (!sourceAccounts || sourceAccounts.length === 0) {
+      throw new McpError(ErrorCode.InvalidParams, 'At least one source account must be provided.');
+    }
+
+    // Buying-signal phrases weighted by intent level (3 = hottest)
+    const SIGNAL_PHRASES: { phrase: string; weight: number; category: string }[] = [
+      // Direct purchase intent
+      { phrase: 'how much', weight: 3, category: 'price inquiry' },
+      { phrase: 'what does it cost', weight: 3, category: 'price inquiry' },
+      { phrase: 'how do i sign up', weight: 3, category: 'sign-up intent' },
+      { phrase: 'how do i join', weight: 3, category: 'sign-up intent' },
+      { phrase: 'where do i sign up', weight: 3, category: 'sign-up intent' },
+      { phrase: 'take my money', weight: 3, category: 'sign-up intent' },
+      { phrase: 'i need this', weight: 3, category: 'sign-up intent' },
+      { phrase: 'i want to join', weight: 3, category: 'sign-up intent' },
+      { phrase: 'dm me', weight: 3, category: 'dm request' },
+      { phrase: 'dm me please', weight: 3, category: 'dm request' },
+      { phrase: 'send me info', weight: 3, category: 'info request' },
+      { phrase: 'send me details', weight: 3, category: 'info request' },
+      { phrase: 'do you have a program', weight: 3, category: 'program inquiry' },
+      { phrase: 'do you offer coaching', weight: 3, category: 'coaching inquiry' },
+      { phrase: 'are you taking clients', weight: 3, category: 'coaching inquiry' },
+      // High frustration / transformation desire
+      { phrase: 'nothing is working', weight: 2, category: 'frustration' },
+      { phrase: 'nothing works for me', weight: 2, category: 'frustration' },
+      { phrase: 'i give up', weight: 2, category: 'frustration' },
+      { phrase: "can't lose weight", weight: 2, category: 'frustration' },
+      { phrase: 'stuck at', weight: 2, category: 'plateau' },
+      { phrase: 'plateau', weight: 2, category: 'plateau' },
+      { phrase: 'i need help', weight: 2, category: 'help request' },
+      { phrase: 'help me', weight: 2, category: 'help request' },
+      { phrase: 'need a coach', weight: 2, category: 'coaching inquiry' },
+      { phrase: 'looking for a coach', weight: 2, category: 'coaching inquiry' },
+      { phrase: 'want results like this', weight: 2, category: 'transformation desire' },
+      { phrase: 'goals', weight: 1, category: 'aspiration' },
+      { phrase: 'transformation', weight: 1, category: 'transformation desire' },
+      { phrase: 'motivat', weight: 1, category: 'aspiration' },
+      { phrase: 'inspired', weight: 1, category: 'aspiration' },
+      { phrase: 'how did you do this', weight: 2, category: 'transformation inquiry' },
+      { phrase: 'what did you do', weight: 2, category: 'transformation inquiry' },
+      { phrase: 'what program', weight: 2, category: 'program inquiry' },
+      { phrase: 'what plan', weight: 2, category: 'program inquiry' },
+      { phrase: 'starting my journey', weight: 2, category: 'new prospect' },
+      { phrase: 'just started', weight: 1, category: 'new prospect' },
+      { phrase: 'lose weight', weight: 1, category: 'fat loss goal' },
+      { phrase: 'lose fat', weight: 1, category: 'fat loss goal' },
+      { phrase: 'weight loss', weight: 1, category: 'fat loss goal' },
+      { phrase: 'fat loss', weight: 1, category: 'fat loss goal' },
+      { phrase: 'get lean', weight: 1, category: 'fat loss goal' },
+    ];
+
+    const DM_OPENERS: Record<string, string> = {
+      'price inquiry': "Hey [name]! Saw your comment — happy to share all the details. What's your main goal right now?",
+      'sign-up intent': "Hey [name]! Love the energy 🔥 Let me shoot you the info on how we get started. What does your current routine look like?",
+      'dm request': "Hey [name]! Sliding in as requested 😄 What's the #1 thing you're struggling with right now?",
+      'info request': "Hey [name]! Dropping the details your way — quick question first: how long have you been trying to lose the weight?",
+      'coaching inquiry': "Hey [name]! Yes, I'm taking on new clients right now. Tell me a bit about where you're at and what you've already tried.",
+      'frustration': "Hey [name]! I saw your comment and I get it — it's exhausting when nothing seems to work. That's exactly why I do what I do. Mind if I ask a couple questions?",
+      'plateau': "Hey [name]! Plateaus are the worst — but they're also very fixable. I'd love to take a look at what you've been doing. Want me to walk you through it?",
+      'help request': "Hey [name]! I've got you. What specifically are you struggling with most right now — nutrition, training, consistency, or something else?",
+      'transformation desire': "Hey [name]! Results like that are 100% possible for you too. I'd love to show you exactly how. What's your current situation like?",
+      'transformation inquiry': "Hey [name]! Happy to break it all down for you! The process is simpler than most people think. Want me to send you a quick overview?",
+      'program inquiry': "Hey [name]! Yes! I have a program built specifically for [niche]. Want me to send you the details?",
+      'fat loss goal': "Hey [name]! Noticed your comment — [niche] is literally what I specialize in. Are you working with anyone right now or going it alone?",
+      'new prospect': "Hey [name]! Love that you're starting your journey — the beginning is actually the easiest time to get real results. Want some guidance?",
+      'aspiration': "Hey [name]! So glad this resonated with you 🙌 If you ever want a clear path to get there yourself, I'd love to help. What's your goal?",
+      default: "Hey [name]! Noticed your comment and wanted to reach out. What's your main goal right now when it comes to [niche]?",
+    };
+
+    // Aggregate leads across all accounts: username -> lead data
+    const leadMap = new Map<string, {
+      username: string;
+      userId: string;
+      score: number;
+      matchedPhrases: string[];
+      categories: Set<string>;
+      topCategory: string;
+      sampleComment: string;
+      sourcePost: string;
+      sourceAccount: string;
+    }>();
+
+    for (const account of sourceAccounts) {
+      if (!isValidUsername(account)) {
+        console.error(`[Tool] Skipping invalid account handle: ${account}`);
+        continue;
+      }
+
+      let userId: number;
+      try {
+        userId = await this.ig.user.getIdByUsername(account);
+      } catch (e: any) {
+        console.error(`[Tool] Could not resolve user ID for ${account}: ${e.message}`);
+        continue;
+      }
+
+      const postsFeed = this.ig.feed.user(userId);
+      let postsFetched = 0;
+
+      while (postsFetched < maxPostsPerAccount) {
+        let batch: any[];
+        try {
+          batch = await postsFeed.items();
+        } catch (e: any) {
+          console.error(`[Tool] Failed to fetch posts for ${account}: ${e.message}`);
+          break;
+        }
+        if (!batch.length) break;
+
+        for (const post of batch) {
+          if (postsFetched >= maxPostsPerAccount) break;
+          postsFetched++;
+
+          const postShortcode = post.code;
+          const postUrl = `https://www.instagram.com/p/${postShortcode}/`;
+
+          const commentsFeed = this.ig.feed.mediaComments(String(post.pk));
+          let commentsFetched = 0;
+
+          while (commentsFetched < maxCommentsPerPost) {
+            let commentBatch: any[];
+            try {
+              commentBatch = await commentsFeed.items();
+            } catch (e: any) {
+              console.error(`[Tool] Failed to fetch comments for post ${post.pk}: ${e.message}`);
+              break;
+            }
+            if (!commentBatch.length) break;
+
+            for (const comment of commentBatch) {
+              if (commentsFetched >= maxCommentsPerPost) break;
+              commentsFetched++;
+
+              const text = (comment.text || '').toLowerCase();
+              let score = 0;
+              const matched: string[] = [];
+              const categories = new Set<string>();
+
+              for (const signal of SIGNAL_PHRASES) {
+                if (text.includes(signal.phrase)) {
+                  score += signal.weight;
+                  matched.push(signal.phrase);
+                  categories.add(signal.category);
+                }
+              }
+
+              if (score === 0) continue;
+
+              const username: string = comment.user?.username || 'unknown';
+              const existing = leadMap.get(username);
+              if (existing) {
+                existing.score += score;
+                existing.matchedPhrases.push(...matched.filter(p => !existing.matchedPhrases.includes(p)));
+                categories.forEach(c => existing.categories.add(c));
+              } else {
+                leadMap.set(username, {
+                  username,
+                  userId: String(comment.user?.pk || ''),
+                  score,
+                  matchedPhrases: [...new Set(matched)],
+                  categories,
+                  topCategory: '',
+                  sampleComment: comment.text.substring(0, 120),
+                  sourcePost: postUrl,
+                  sourceAccount: account,
+                });
+              }
+            }
+
+            if (!commentsFeed.isMoreAvailable()) break;
+            await new Promise(r => setTimeout(r, 300 + Math.random() * 300));
+          }
+
+          await new Promise(r => setTimeout(r, 400 + Math.random() * 400));
+        }
+
+        if (!postsFeed.isMoreAvailable()) break;
+        await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+      }
+
+      await new Promise(r => setTimeout(r, 600 + Math.random() * 600));
+    }
+
+    // Sort by score descending, pick top 50
+    const sorted = [...leadMap.values()]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 50);
+
+    const leads = sorted.map(lead => {
+      // Determine top category by picking the highest-weight matched signal category
+      let topCat = 'aspiration';
+      let topWeight = 0;
+      for (const signal of SIGNAL_PHRASES) {
+        if (lead.matchedPhrases.includes(signal.phrase) && signal.weight > topWeight) {
+          topWeight = signal.weight;
+          topCat = signal.category;
+        }
+      }
+
+      const opener = (DM_OPENERS[topCat] || DM_OPENERS['default'])
+        .replace('[name]', lead.username)
+        .replace('[niche]', niche);
+
+      return {
+        username: lead.username,
+        profileUrl: `https://www.instagram.com/${lead.username}/`,
+        signalScore: lead.score,
+        intentLevel: lead.score >= 6 ? 'HOT' : lead.score >= 3 ? 'WARM' : 'COOL',
+        topCategory: topCat,
+        matchedPhrases: lead.matchedPhrases,
+        sampleComment: lead.sampleComment,
+        sourcePost: lead.sourcePost,
+        sourceAccount: lead.sourceAccount,
+        suggestedDmOpener: opener,
+      };
+    });
+
+    const hot = leads.filter(l => l.intentLevel === 'HOT').length;
+    const warm = leads.filter(l => l.intentLevel === 'WARM').length;
+
+    return {
+      results: {
+        summary: {
+          totalLeadsFound: leads.length,
+          hotLeads: hot,
+          warmLeads: warm,
+          coolLeads: leads.length - hot - warm,
+          accountsScanned: sourceAccounts.length,
+          niche,
+        },
+        leads,
+      },
+    };
+  }
+
+  private async getMediaIdFromUrl(url: string): Promise<string | null> {
      try {
         // Extract shortcode first
         const shortcode = extractPostIdFromUrl(url);
