@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -1114,14 +1114,14 @@ class InstagramEngagementServer {
     const port = process.env.PORT ? parseInt(process.env.PORT) : null;
 
     if (port) {
-      console.error(`[Setup] Starting MCP server in HTTP/SSE mode on port ${port}...`);
+      console.error(`[Setup] Starting MCP server in HTTP mode on port ${port}...`);
 
       const app = express();
-      const transports: Record<string, SSEServerTransport> = {};
+      app.use(express.json());
 
       app.use((req, res, next) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id');
         if (req.method === 'OPTIONS') { res.sendStatus(204); return; }
         next();
@@ -1131,43 +1131,36 @@ class InstagramEngagementServer {
         res.json({ status: 'ok' });
       });
 
-      app.get('/sse', async (req, res) => {
-        console.error('[SSE] New connection from', req.headers.origin || 'unknown');
+      const transports = new Map<string, StreamableHTTPServerTransport>();
 
-        // Build the full message URL so the client can POST back correctly
-        const proto = req.headers['x-forwarded-proto'] || 'https';
-        const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${port}`;
-        const messageUrl = `${proto}://${host}/message`;
+      app.all('/mcp', async (req, res) => {
+        console.error(`[MCP] ${req.method} /mcp session=${req.headers['mcp-session-id'] || 'new'}`);
+        try {
+          const sessionId = req.headers['mcp-session-id'] as string | undefined;
+          let transport = sessionId ? transports.get(sessionId) : undefined;
 
-        const transport = new SSEServerTransport(messageUrl, res);
-        transports[transport.sessionId] = transport;
+          if (!transport) {
+            transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+            const connectionServer = new Server(
+              { name: 'instagram-engagement-server', version: '0.1.0' },
+              { capabilities: { tools: {} } }
+            );
+            this.attachHandlers(connectionServer);
+            await connectionServer.connect(transport);
+            if (transport.sessionId) {
+              transports.set(transport.sessionId, transport);
+            }
+          }
 
-        res.on('close', () => {
-          delete transports[transport.sessionId];
-          console.error(`[SSE] Connection closed: ${transport.sessionId}`);
-        });
-
-        // Create a fresh server per connection so handlers don't clash
-        const connectionServer = new Server(
-          { name: 'instagram-engagement-server', version: '0.1.0' },
-          { capabilities: { tools: {} } }
-        );
-        this.attachHandlers(connectionServer);
-        await connectionServer.connect(transport);
-      });
-
-      app.post('/message', async (req, res) => {
-        const sessionId = req.query.sessionId as string;
-        const transport = transports[sessionId];
-        if (!transport) {
-          res.status(404).json({ error: 'Session not found' });
-          return;
+          await transport.handleRequest(req, res, req.body);
+        } catch (err: any) {
+          console.error('[MCP] Error handling request:', err.message);
+          if (!res.headersSent) res.status(500).json({ error: err.message });
         }
-        await transport.handlePostMessage(req, res);
       });
 
       app.listen(port, () => {
-        console.error(`[Setup] MCP server listening — SSE: http://localhost:${port}/sse`);
+        console.error(`[Setup] MCP server listening on port ${port} — endpoint: /mcp`);
       });
     } else {
       console.error('[Setup] Starting MCP server on stdio...');
