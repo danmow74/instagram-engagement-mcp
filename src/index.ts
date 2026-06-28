@@ -11,7 +11,7 @@ import {
 import axios from 'axios';
 import { IgApiClient } from 'instagram-private-api';
 import * as dotenv from 'dotenv';
-import http from 'http';
+import express from 'express';
 
 // Load environment variables
 dotenv.config();
@@ -132,8 +132,13 @@ class InstagramEngagementServer {
     }
   }
 
-  private setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  private attachHandlers(server: Server) {
+    this.setupToolHandlers(server);
+  }
+
+  private setupToolHandlers(server?: Server) {
+    const s = server || this.server;
+    s.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
           name: 'analyze_post_comments',
@@ -283,7 +288,7 @@ class InstagramEngagementServer {
       ],
     }));
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    s.setRequestHandler(CallToolRequestSchema, async (request) => {
       console.error(`[Tool] Request to execute tool: ${request.params.name}`);
       
       // Ensure we're logged in to Instagram
@@ -1109,70 +1114,66 @@ class InstagramEngagementServer {
     const port = process.env.PORT ? parseInt(process.env.PORT) : null;
 
     if (port) {
-      // HTTP/SSE mode for claude.ai online connector
-      console.error(`[Setup] Starting Instagram Engagement MCP server on HTTP port ${port}...`);
+      console.error(`[Setup] Starting MCP server in HTTP/SSE mode on port ${port}...`);
+
+      const app = express();
       const transports: Record<string, SSEServerTransport> = {};
 
-      const httpServer = http.createServer(async (req, res) => {
-        // CORS headers
+      app.use((req, res, next) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-        if (req.method === 'OPTIONS') {
-          res.writeHead(204);
-          res.end();
-          return;
-        }
-
-        const url = new URL(req.url || '/', `http://localhost:${port}`);
-
-        if (req.method === 'GET' && url.pathname === '/sse') {
-          console.error('[HTTP] New SSE connection');
-          const transport = new SSEServerTransport('/message', res);
-          transports[transport.sessionId] = transport;
-
-          res.on('close', () => {
-            delete transports[transport.sessionId];
-            console.error(`[HTTP] SSE connection closed: ${transport.sessionId}`);
-          });
-
-          await this.server.connect(transport);
-          return;
-        }
-
-        if (req.method === 'POST' && url.pathname === '/message') {
-          const sessionId = url.searchParams.get('sessionId') || '';
-          const transport = transports[sessionId];
-          if (!transport) {
-            res.writeHead(404, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Session not found' }));
-            return;
-          }
-          await transport.handlePostMessage(req, res);
-          return;
-        }
-
-        if (url.pathname === '/health') {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ status: 'ok' }));
-          return;
-        }
-
-        res.writeHead(404);
-        res.end();
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id');
+        if (req.method === 'OPTIONS') { res.sendStatus(204); return; }
+        next();
       });
 
-      httpServer.listen(port, () => {
-        console.error(`[Setup] MCP server listening on port ${port}`);
-        console.error(`[Setup] SSE endpoint: http://localhost:${port}/sse`);
+      app.get('/health', (_req, res) => {
+        res.json({ status: 'ok' });
+      });
+
+      app.get('/sse', async (req, res) => {
+        console.error('[SSE] New connection from', req.headers.origin || 'unknown');
+
+        // Build the full message URL so the client can POST back correctly
+        const proto = req.headers['x-forwarded-proto'] || 'https';
+        const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${port}`;
+        const messageUrl = `${proto}://${host}/message`;
+
+        const transport = new SSEServerTransport(messageUrl, res);
+        transports[transport.sessionId] = transport;
+
+        res.on('close', () => {
+          delete transports[transport.sessionId];
+          console.error(`[SSE] Connection closed: ${transport.sessionId}`);
+        });
+
+        // Create a fresh server per connection so handlers don't clash
+        const connectionServer = new Server(
+          { name: 'instagram-engagement-server', version: '0.1.0' },
+          { capabilities: { tools: {} } }
+        );
+        this.attachHandlers(connectionServer);
+        await connectionServer.connect(transport);
+      });
+
+      app.post('/message', async (req, res) => {
+        const sessionId = req.query.sessionId as string;
+        const transport = transports[sessionId];
+        if (!transport) {
+          res.status(404).json({ error: 'Session not found' });
+          return;
+        }
+        await transport.handlePostMessage(req, res);
+      });
+
+      app.listen(port, () => {
+        console.error(`[Setup] MCP server listening — SSE: http://localhost:${port}/sse`);
       });
     } else {
-      // stdio mode for local use
-      console.error('[Setup] Starting Instagram Engagement MCP server on stdio...');
+      console.error('[Setup] Starting MCP server on stdio...');
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
-      console.error('[Setup] Instagram Engagement MCP server running on stdio');
+      console.error('[Setup] MCP server running on stdio');
     }
   }
 }
