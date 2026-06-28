@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -10,6 +11,7 @@ import {
 import axios from 'axios';
 import { IgApiClient } from 'instagram-private-api';
 import * as dotenv from 'dotenv';
+import http from 'http';
 
 // Load environment variables
 dotenv.config();
@@ -1104,10 +1106,74 @@ class InstagramEngagementServer {
    }
 
   async run() {
-    console.error('[Setup] Starting Instagram Engagement MCP server...');
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('[Setup] Instagram Engagement MCP server running on stdio');
+    const port = process.env.PORT ? parseInt(process.env.PORT) : null;
+
+    if (port) {
+      // HTTP/SSE mode for claude.ai online connector
+      console.error(`[Setup] Starting Instagram Engagement MCP server on HTTP port ${port}...`);
+      const transports: Record<string, SSEServerTransport> = {};
+
+      const httpServer = http.createServer(async (req, res) => {
+        // CORS headers
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+        if (req.method === 'OPTIONS') {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+
+        const url = new URL(req.url || '/', `http://localhost:${port}`);
+
+        if (req.method === 'GET' && url.pathname === '/sse') {
+          console.error('[HTTP] New SSE connection');
+          const transport = new SSEServerTransport('/message', res);
+          transports[transport.sessionId] = transport;
+
+          res.on('close', () => {
+            delete transports[transport.sessionId];
+            console.error(`[HTTP] SSE connection closed: ${transport.sessionId}`);
+          });
+
+          await this.server.connect(transport);
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/message') {
+          const sessionId = url.searchParams.get('sessionId') || '';
+          const transport = transports[sessionId];
+          if (!transport) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Session not found' }));
+            return;
+          }
+          await transport.handlePostMessage(req, res);
+          return;
+        }
+
+        if (url.pathname === '/health') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'ok' }));
+          return;
+        }
+
+        res.writeHead(404);
+        res.end();
+      });
+
+      httpServer.listen(port, () => {
+        console.error(`[Setup] MCP server listening on port ${port}`);
+        console.error(`[Setup] SSE endpoint: http://localhost:${port}/sse`);
+      });
+    } else {
+      // stdio mode for local use
+      console.error('[Setup] Starting Instagram Engagement MCP server on stdio...');
+      const transport = new StdioServerTransport();
+      await this.server.connect(transport);
+      console.error('[Setup] Instagram Engagement MCP server running on stdio');
+    }
   }
 }
 
