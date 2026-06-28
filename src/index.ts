@@ -1132,49 +1132,16 @@ class InstagramEngagementServer {
         res.json({ status: 'ok' });
       });
 
-      const transports = new Map<string, StreamableHTTPServerTransport>();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+      });
+      this.attachHandlers(this.server);
+      await this.server.connect(transport);
 
       app.all('/mcp', async (req, res) => {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        console.error(`[MCP] ${req.method} /mcp session=${sessionId || 'new'}`);
-
+        console.error(`[MCP] ${req.method} session=${req.headers['mcp-session-id'] || 'new'}`);
         try {
-          let transport = sessionId ? transports.get(sessionId) : undefined;
-
-          if (!transport) {
-            // New session — only allow POST (initialize handshake)
-            if (req.method !== 'POST') {
-              res.status(400).json({ error: 'New sessions must start with POST' });
-              return;
-            }
-
-            transport = new StreamableHTTPServerTransport({
-              sessionIdGenerator: () => randomUUID(),
-            });
-
-            const connectionServer = new Server(
-              { name: 'instagram-engagement-server', version: '0.1.0' },
-              { capabilities: { tools: {} } }
-            );
-            this.attachHandlers(connectionServer);
-            await connectionServer.connect(transport);
-
-            transport.onclose = () => {
-              if (transport!.sessionId) transports.delete(transport!.sessionId);
-              console.error(`[MCP] Session closed: ${transport!.sessionId}`);
-            };
-
-            // Handle the request first so the session ID is set in the response header
-            await transport.handleRequest(req, res, req.body);
-
-            // Store after handling so sessionId is populated
-            if (transport.sessionId) {
-              transports.set(transport.sessionId, transport);
-              console.error(`[MCP] New session created: ${transport.sessionId}`);
-            }
-          } else {
-            await transport.handleRequest(req, res, req.body);
-          }
+          await transport.handleRequest(req, res, req.body);
         } catch (err: any) {
           console.error('[MCP] Error:', err.message);
           if (!res.headersSent) res.status(500).json({ error: err.message });
